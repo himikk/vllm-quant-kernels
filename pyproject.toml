@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-quant-kernels"
+version = "0.1.0"
+description = "Quantized lm_head kernels for vLLM on NVIDIA Jetson Thor (sm_110a)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.entry-points."vllm.general_plugins"]
+quant_kernels = "vllm_quant_kernels:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
