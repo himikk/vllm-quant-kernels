@@ -9,7 +9,44 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
-from ._kernels import int8_gmv, _make_thor_gemm_kernel, _make_thor_fp8_gemm_kernel, _make_thor_w8a8_gemm_kernel
+from ._kernels import (
+    int8_gmv,
+    _make_thor_gemm_kernel,
+    _make_thor_fp8_gemm_kernel,
+    _make_thor_w8a8_gemm_kernel,
+    _make_thor_mxfp8_gemm_kernel,
+    MXFP8_GROUP_SIZE,
+)
+
+
+def _quantize_to_mxfp8(t: torch.Tensor, group_size: int = MXFP8_GROUP_SIZE):
+    """Quantize a 2D tensor to MXFP8: e4m3 values + e8m0 per-group scales.
+
+    Args:
+        t: (R, K) fp32/fp16/bf16, K must be divisible by group_size.
+
+    Returns:
+        (values_uint8_view, scales_uint8) where:
+          values_uint8_view: (R, K) uint8 view of float8_e4m3fn data
+          scales_uint8:      (R, K // group_size) uint8 (e8m0 encoding,
+                             scale = 2^(scales_uint8 - 127))
+    """
+    R, K = t.shape
+    assert K % group_size == 0, f"K={K} must be divisible by group_size={group_size}"
+    t_fp32 = t.float()
+    groups = t_fp32.view(R, K // group_size, group_size)
+    group_max = groups.abs().amax(dim=-1).clamp(min=1e-30)  # (R, K//group_size)
+
+    # e8m0: scale = 2^(uint8 - 127). Solve 2^k * 448 >= group_max → k >= log2(group_max / 448)
+    # Use ceil so the largest element fits in [-448, 448].
+    k_exp = torch.ceil(torch.log2(group_max / 448.0))
+    k_exp = k_exp.clamp(min=-127.0, max=127.0)
+    scales_uint8 = (k_exp + 127.0).to(torch.uint8)              # (R, K//group_size)
+    scales_fp32 = torch.pow(2.0, k_exp).unsqueeze(-1)           # (R, K//group_size, 1)
+
+    quantized = (groups / scales_fp32).clamp(-448.0, 448.0)
+    quantized = quantized.to(torch.float8_e4m3fn).view(R, K)
+    return quantized.view(torch.uint8), scales_uint8
 
 
 @PluggableLayer.register_oot(name="LogitsProcessor")
@@ -35,15 +72,20 @@ class QuantizedLogitsProcessor(LogitsProcessor):
             self._init_int8(lm_head)
 
         # If not quantized (already INT8 or small vocab), fall through
-        if not hasattr(lm_head, "_int8_w") and not hasattr(lm_head, "_fp8_w") and not hasattr(lm_head, "_w8a8_w"):
+        if (not hasattr(lm_head, "_int8_w")
+                and not hasattr(lm_head, "_fp8_w")
+                and not hasattr(lm_head, "_w8a8_w")
+                and not hasattr(lm_head, "_mxfp8_w")):
             return super()._get_logits(hidden_states, lm_head, embedding_bias)
 
         return self._quantized_forward(hidden_states, lm_head, embedding_bias)
 
     def _init_int8(self, lm_head: VocabParallelEmbedding) -> None:
-        """Quantize lm_head.weight to FP8, W8A8, or W8A16 if applicable.
+        """Quantize lm_head.weight if applicable.
 
         Dtype selected by env vars (checked in priority order):
+          VLLM_USE_MXFP8_LMHEAD=1 — MX FP8 e4m3 with per-32-element e8m0 scales,
+                                    native tcgen05.mma MX format, Thor only
           VLLM_USE_FP8_LMHEAD=1   — per-row FP8 e4m3, scale = row_max / 448, Thor only
           VLLM_USE_W8A8_LMHEAD=1  — per-row INT8 weights + per-tensor INT8 activations
                                      at runtime, Thor only (falls back to W8A16)
@@ -66,8 +108,26 @@ class QuantizedLogitsProcessor(LogitsProcessor):
             val = os.environ.get(name, "")
             return val.lower() in ("1", "true", "yes", "on")
 
-        use_fp8  = _env_bool("VLLM_USE_FP8_LMHEAD")
-        use_w8a8 = _env_bool("VLLM_USE_W8A8_LMHEAD")
+        use_mxfp8 = _env_bool("VLLM_USE_MXFP8_LMHEAD")
+        use_fp8   = _env_bool("VLLM_USE_FP8_LMHEAD")
+        use_w8a8  = _env_bool("VLLM_USE_W8A8_LMHEAD")
+
+        if use_mxfp8:
+            if not is_thor:
+                print(
+                    "[vllm-quant-kernels] VLLM_USE_MXFP8_LMHEAD requires Thor (sm_110+),"
+                    " falling back to int8",
+                    file=_sys.stderr, flush=True,
+                )
+            elif w.shape[1] % MXFP8_GROUP_SIZE != 0:
+                print(
+                    f"[vllm-quant-kernels] VLLM_USE_MXFP8_LMHEAD requires K divisible "
+                    f"by {MXFP8_GROUP_SIZE} (got K={w.shape[1]}), falling back to int8",
+                    file=_sys.stderr, flush=True,
+                )
+            else:
+                self._init_mxfp8(lm_head, w, _sys)
+                return
 
         if use_fp8:
             if not is_thor:
@@ -175,13 +235,38 @@ class QuantizedLogitsProcessor(LogitsProcessor):
 
         lm_head._fp8_gemm_kernel, lm_head._fp8_n_bucket = _make_thor_fp8_gemm_kernel()
 
+    def _init_mxfp8(self, lm_head, w, _sys) -> None:
+        """Quantize to MXFP8 (e4m3 + per-32-element e8m0 scales). Thor only.
+
+        Storage:
+          lm_head._mxfp8_w        — (M, K) uint8 view of float8_e4m3fn
+          lm_head._mxfp8_w_scales — (M, K//32) uint8, e8m0 encoded
+        """
+        w_uint8, w_scales = _quantize_to_mxfp8(w)
+        lm_head._mxfp8_w = w_uint8
+        lm_head._mxfp8_w_scales = w_scales
+
+        saved_mb = w.numel() * w.element_size() // 1024 // 1024
+        scale_mb = w_scales.numel() // 1024 // 1024
+        print(
+            f"[vllm-quant-kernels] lm_head quantized: "
+            f"fp16 {w_uint8.shape[0]}×{w_uint8.shape[1]} → mxfp8 e4m3 "
+            f"(saved {saved_mb} MB, scales {scale_mb} MB, kernel=thor/mxfp8)",
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        lm_head._mxfp8_gemm_kernel, lm_head._mxfp8_n_bucket = _make_thor_mxfp8_gemm_kernel()
+
     def _quantized_forward(
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Run quantized forward pass — dispatches to fp8, w8a8, or int8 kernel."""
+        """Run quantized forward pass — dispatches to mxfp8, fp8, w8a8, or int8 kernel."""
+        if hasattr(lm_head, "_mxfp8_w"):
+            return self._mxfp8_forward(hidden_states, lm_head, embedding_bias)
         if hasattr(lm_head, "_fp8_w"):
             return self._fp8_forward(hidden_states, lm_head, embedding_bias)
         if hasattr(lm_head, "_w8a8_w"):
@@ -211,6 +296,50 @@ class QuantizedLogitsProcessor(LogitsProcessor):
             out.stride(1), out.stride(0),
             lm_head._fp8_w.stride(0), lm_head._fp8_w.stride(1),
             xc.stride(0), xc.stride(1),
+        )
+
+        logits = out.view(hidden_states.shape[:-1] + (M,))
+        if embedding_bias is not None:
+            logits = logits + embedding_bias
+        return logits
+
+    def _mxfp8_forward(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """MXFP8 forward — Thor only, uses tcgen05.mma with MX format operands.
+
+        Activations are quantized to e4m3 + per-32-element e8m0 scales at runtime.
+        """
+        M, K = lm_head._mxfp8_w.shape
+        x = hidden_states.view(-1, K)
+        batch = x.shape[0]
+        out = torch.empty(batch, M, dtype=torch.float16, device=x.device)
+
+        # Quantize activations to MXFP8
+        x_uint8, x_scales = _quantize_to_mxfp8(x)
+        x_uint8 = x_uint8.contiguous() if not x_uint8.is_contiguous() else x_uint8
+        x_scales = x_scales.contiguous() if not x_scales.is_contiguous() else x_scales
+
+        grid = lambda meta: (
+            (M     + meta["BLOCK_M"] - 1) // meta["BLOCK_M"],
+            (batch + meta["BLOCK_N"] - 1) // meta["BLOCK_N"],
+        )
+        lm_head._mxfp8_gemm_kernel[grid](
+            out,
+            lm_head._mxfp8_w,
+            x_uint8,
+            lm_head._mxfp8_w_scales,
+            x_scales,
+            M, batch, K, lm_head._mxfp8_n_bucket(batch),
+            out.stride(1), out.stride(0),
+            lm_head._mxfp8_w.stride(0), lm_head._mxfp8_w.stride(1),
+            x_uint8.stride(0), x_uint8.stride(1),
+            lm_head._mxfp8_w_scales.stride(0), lm_head._mxfp8_w_scales.stride(1),
+            x_scales.stride(0), x_scales.stride(1),
+            GROUP_SIZE=MXFP8_GROUP_SIZE,
         )
 
         logits = out.view(hidden_states.shape[:-1] + (M,))

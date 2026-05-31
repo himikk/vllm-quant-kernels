@@ -419,3 +419,152 @@ def _make_thor_w8a8_gemm_kernel():
         )
 
     return int8_w8a8_gemm, _n_bucket
+
+
+# ---------------------------------------------------------------------------
+# Thor-specific MXFP8 GEMM kernel (sm_110+)
+# Uses tl.dot_scaled with e4m3 inputs and e8m0 per-group scales (group size 32).
+# Maps to tcgen05.mma with MX format operands on sm_110a — native hardware path.
+# ---------------------------------------------------------------------------
+
+MXFP8_GROUP_SIZE = 32
+
+
+def _make_thor_mxfp8_gemm_kernel():
+    """Build and return the Thor MXFP8 GEMM kernel.
+
+    Weights stored as fp8 e4m3 (1 byte/element), per-32-element group e8m0 scales.
+    Activations quantized to fp8 e4m3 + e8m0 scales at runtime.
+    Only called on Thor (sm_110+) devices.
+    """
+    _cfgs = []
+    # MXFP8 scales group K by 32 elements — BLOCK_K must be a multiple of 32.
+    for _BM in [128, 256]:
+        for _BN in [16, 32]:
+            for _BK in [64, 128]:
+                for _nw in [4, 8]:
+                    for _ns in [2, 3]:
+                        _cfgs.append(
+                            triton.Config(
+                                {"BLOCK_M": _BM, "BLOCK_N": _BN, "BLOCK_K": _BK},
+                                num_warps=_nw,
+                                num_stages=_ns,
+                            )
+                        )
+    for _BM, _BN in [(128, 128), (128, 256), (256, 128)]:
+        for _BK in [64, 128]:
+            for _ns in [2, 3]:
+                _cfgs.append(
+                    triton.Config(
+                        {"BLOCK_M": _BM, "BLOCK_N": _BN, "BLOCK_K": _BK},
+                        num_warps=8,
+                        num_stages=_ns,
+                    )
+                )
+
+    @triton.autotune(
+        configs=_cfgs,
+        key=["M", "K", "N_BUCKET"],
+        cache_results=True,
+        rep=500,
+    )
+    @triton.jit
+    def mxfp8_gemm(
+        out_ptr,
+        w_ptr,
+        x_ptr,
+        ws_ptr,
+        xs_ptr,
+        M,
+        N,
+        K,
+        N_BUCKET,
+        stride_om,
+        stride_on,
+        stride_wm,
+        stride_wk,
+        stride_xn,
+        stride_xk,
+        stride_wsm,
+        stride_wsg,
+        stride_xsn,
+        stride_xsg,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+    ):
+        """MXFP8 GEMM with native tcgen05.mma on Thor (sm_110+).
+
+        w:  (M, K) e4m3 stored as uint8 view
+        x:  (N, K) e4m3 stored as uint8 view
+        ws: (M, K//32) uint8 e8m0 per-group weight scales
+        xs: (N, K//32) uint8 e8m0 per-group activation scales
+        out: (N, M) float16
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+        rg = tl.arange(0, BLOCK_K // GROUP_SIZE)
+        rmask = rm < M
+        nmask = rn < N
+
+        w_blk = w_ptr + (rm[:, None] * stride_wm + rk[None, :] * stride_wk)
+        x_blk = x_ptr + (rn[:, None] * stride_xn + rk[None, :] * stride_xk)
+        ws_blk = ws_ptr + (rm[:, None] * stride_wsm + rg[None, :] * stride_wsg)
+        xs_blk = xs_ptr + (rn[:, None] * stride_xsn + rg[None, :] * stride_xsg)
+
+        # acc shape is (N, M) to match our output layout
+        acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+
+        n_groups_per_tile = BLOCK_K // GROUP_SIZE
+        K_groups = K // GROUP_SIZE
+
+        for k0 in range(0, K, BLOCK_K):
+            kmask = (k0 + rk) < K
+            wi = tl.load(
+                w_blk,
+                mask=rmask[:, None] & kmask[None, :],
+                other=0,
+            )
+            xi = tl.load(
+                x_blk,
+                mask=nmask[:, None] & kmask[None, :],
+                other=0,
+            )
+            g0 = k0 // GROUP_SIZE
+            gmask = (g0 + rg) < K_groups
+            ws_tile = tl.load(
+                ws_blk,
+                mask=rmask[:, None] & gmask[None, :],
+                other=0,
+            )
+            xs_tile = tl.load(
+                xs_blk,
+                mask=nmask[:, None] & gmask[None, :],
+                other=0,
+            )
+            # tl.dot_scaled: lhs is activations (N, K), rhs is weights (K, M)
+            # rhs_scale shape: [N=M, K//32] — already in [M, K//32] layout
+            acc = tl.dot_scaled(
+                xi, xs_tile, "e4m3",
+                tl.trans(wi), ws_tile, "e4m3",
+                acc=acc,
+                out_dtype=tl.float32,
+            )
+            w_blk += BLOCK_K * stride_wk
+            x_blk += BLOCK_K * stride_xk
+            ws_blk += n_groups_per_tile * stride_wsg
+            xs_blk += n_groups_per_tile * stride_xsg
+
+        out_blk = out_ptr + rn[:, None] * stride_on + rm[None, :] * stride_om
+        tl.store(
+            out_blk,
+            acc.to(tl.float16),
+            mask=nmask[:, None] & rmask[None, :],
+        )
+
+    return mxfp8_gemm, _n_bucket

@@ -224,6 +224,100 @@ class TestInt8Precision:
         assert cos_sim > 0.9999, f"cosine similarity too low: {cos_sim:.6f}"
 
 
+class TestMxfp8Precision:
+    """Compare MXFP8 (e4m3 + per-32-element e8m0 scales) against fp16 cuBLAS reference.
+
+    Only runs on Thor (sm_110+) — tl.dot_scaled maps to tcgen05.mma MX format.
+    Uses the real Qwen3.5-122B lm_head shape (248320 × 3072).
+
+    For random-Gaussian-distributed weights (this test), MXFP8 gives similar accuracy
+    to plain FP8: the e8m0 group scale rounds up to the next power of 2, adding ~30%
+    overhead per group that offsets the finer group granularity. The MX format wins
+    on weight distributions with highly heterogeneous within-row dynamic range.
+    """
+
+    M = 248_320
+    K = 3_072
+
+    @pytest.fixture(scope="class")
+    def quant_lm_head_mxfp8(self):
+        import os
+        from types import SimpleNamespace
+        from vllm_quant_kernels._quant import QuantizedLogitsProcessor
+
+        cap = torch.cuda.get_device_capability()
+        if cap[0] < 10:
+            pytest.skip("MXFP8 kernel requires Thor (sm_110+)")
+
+        old = os.environ.get("VLLM_USE_MXFP8_LMHEAD")
+        os.environ["VLLM_USE_MXFP8_LMHEAD"] = "1"
+
+        w_fp16 = torch.randn(self.M, self.K, device="cuda", dtype=torch.float16)
+
+        class _FakeWeight:
+            def __init__(self, t):
+                self.data = t
+                self.dtype = t.dtype
+                self.shape = t.shape
+                self.device = t.device
+
+        lm_head = SimpleNamespace(weight=_FakeWeight(w_fp16))
+
+        processor = QuantizedLogitsProcessor(self.M)
+        processor._init_int8(lm_head)
+
+        if old is None:
+            del os.environ["VLLM_USE_MXFP8_LMHEAD"]
+        else:
+            os.environ["VLLM_USE_MXFP8_LMHEAD"] = old
+
+        assert hasattr(lm_head, "_mxfp8_w"), "mxfp8 quantization should have triggered"
+        assert hasattr(lm_head, "_mxfp8_w_scales")
+        return lm_head, w_fp16
+
+    def _precision_check(self, quant_lm_head_mxfp8, batch):
+        import torch.nn.functional as F
+        from vllm_quant_kernels._quant import QuantizedLogitsProcessor
+
+        lm_head, w_fp16 = quant_lm_head_mxfp8
+        x = torch.randn(batch, self.K, device="cuda", dtype=torch.float16)
+        ref = F.linear(x, w_fp16)
+
+        processor = QuantizedLogitsProcessor(self.M)
+        processor._int8_initialized = True
+        out = processor._quantized_forward(x, lm_head, None)
+
+        diff = (out.float() - ref.float()).abs()
+        max_err  = diff.max().item()
+        mean_err = diff.mean().item()
+        ref_mag  = ref.float().abs().mean().item()
+        rel_err  = mean_err / (ref_mag + 1e-8)
+        cos_sim  = F.cosine_similarity(
+            out.float().reshape(batch, -1),
+            ref.float().reshape(batch, -1),
+            dim=1,
+        ).mean().item()
+        print(
+            f"\n[mxfp8] batch={batch}  max_abs={max_err:.4f}  mean_abs={mean_err:.4f}"
+            f"  rel={rel_err * 100:.3f}%  cos_sim={cos_sim:.6f}"
+        )
+        return max_err, rel_err, cos_sim
+
+    def test_precision_batch1(self, quant_lm_head_mxfp8):
+        """MXFP8 single-token decode."""
+        max_err, rel_err, cos_sim = self._precision_check(quant_lm_head_mxfp8, batch=1)
+        assert max_err < 20.0,  f"max abs error too large: {max_err:.4f}"
+        assert rel_err < 0.06,  f"mean relative error too large: {rel_err * 100:.3f}%"
+        assert cos_sim > 0.998, f"cosine similarity too low: {cos_sim:.6f}"
+
+    def test_precision_batch4(self, quant_lm_head_mxfp8):
+        """MXFP8 4-token decode."""
+        max_err, rel_err, cos_sim = self._precision_check(quant_lm_head_mxfp8, batch=4)
+        assert max_err < 20.0,  f"max abs error too large: {max_err:.4f}"
+        assert rel_err < 0.06,  f"mean relative error too large: {rel_err * 100:.3f}%"
+        assert cos_sim > 0.998, f"cosine similarity too low: {cos_sim:.6f}"
+
+
 class TestW8A8Precision:
     """Compare W8A8 INT8×INT8 quantized lm_head output against fp16 cuBLAS reference.
 
