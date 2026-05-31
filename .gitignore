@@ -7,3 +7,7 @@ build/
 .triton/
 *.nsys-rep
 *.sqlite
+
+# Large fixture tensors extracted from HF models (regenerate with
+# tests/fixtures/extract_lm_head.py)
+tests/fixtures/*.safetensors

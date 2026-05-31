@@ -40,6 +40,19 @@ Measured on Thor vs. FP16 cuBLAS reference:
 
 **Note on MXFP8 vs FP8 accuracy:** On random Gaussian weights, MXFP8 gives essentially the same accuracy as plain FP8. The e8m0 group scale rounds up to the next power of 2 (~30% overhead per group) which offsets the finer 32-element group granularity. MXFP8 typically wins on weight distributions with highly heterogeneous within-row dynamic range (e.g., attention QKV with channel-wise outliers); for `lm_head` projections it is roughly equivalent. Use MXFP8 when you want hardware-native MX format support (single `tcgen05.mma` instruction with built-in scaling) or when working with weight distributions that benefit from per-group scales.
 
+### Accuracy on the real Qwen3.5-122B `lm_head` tensor
+
+`tests/test_real_lm_head.py` runs each mode against the actual `lm_head.weight` extracted from `Intel/Qwen3.5-122B-A10B-int4-AutoRound`. The fixture (1.5 GB) is gitignored — regenerate with `tests/fixtures/extract_lm_head.py` on a host where the model is cached.
+
+| Mode | batch=1 rel | batch=4 rel | batch=1 cos | batch=4 cos |
+|------|------------|------------|------------|------------|
+| W8A16 INT8 | 1.04% | 1.02% | 0.999945 | 0.999947 |
+| W8A8       | 1.30% | 1.45% | 0.999915 | 0.999893 |
+| FP8        | 3.81% | 3.79% | 0.999278 | 0.999274 |
+| MXFP8      | 3.81% | 3.80% | 0.999274 | 0.999270 |
+
+The real `lm_head` has a well-behaved distribution (row absmax varies only ~6×, abs_max=0.19, p99.9=0.057), so MXFP8 ≈ FP8 here — confirming the synthetic-data finding above.
+
 ## Requirements
 
 - Python 3.10+
