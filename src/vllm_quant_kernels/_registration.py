@@ -47,7 +47,7 @@ def register_all() -> None:
             and not use_int8 and not use_sampler):
         print(
             f"[vllm-quant-kernels] Plugin loaded but disabled "
-            f"(set {_ENV_MXFP4}=1, {_ENV_MXFP8}=1, {_ENV_FP8}=1, {_ENV_W8A8}=1, "
+            f"(set {_ENV_MXFP4}=1 | {_ENV_MXFP8}=1 | {_ENV_FP8}=1 | {_ENV_W8A8}=1 | "
             f"{_ENV_INT8}=1 to enable quantized LM head, or {_ENV_SAMPLER}=1 to "
             f"enable the fused sampler).",
             file=sys.stderr, flush=True,
