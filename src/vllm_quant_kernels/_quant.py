@@ -121,6 +121,7 @@ class QuantizedLogitsProcessor(LogitsProcessor):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor],
+        skip_gather: bool = False,
     ) -> Optional[torch.Tensor]:
         # Initialize quantization once per lm_head
         if not hasattr(self, "_int8_initialized"):
@@ -133,7 +134,9 @@ class QuantizedLogitsProcessor(LogitsProcessor):
                 and not hasattr(lm_head, "_w8a8_w")
                 and not hasattr(lm_head, "_mxfp8_w")
                 and not hasattr(lm_head, "_mxfp4_w")):
-            return super()._get_logits(hidden_states, lm_head, embedding_bias)
+            return super()._get_logits(
+                hidden_states, lm_head, embedding_bias, skip_gather
+            )
 
         return self._quantized_forward(hidden_states, lm_head, embedding_bias)
 
